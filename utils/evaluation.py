@@ -17,7 +17,7 @@ def get_anomaly_ratio(dataset_name: str) -> float:
         "SMAP": 0.01,
         "PSM": 0.01,
         # newly added datasets
-        "CyberSecuriy": 0.01,
+        "CyberSecurity": 0.01,
         "CreditCard": 0.01,
         "FallingPeople": 0.01,
     }

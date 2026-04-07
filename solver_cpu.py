@@ -8,7 +8,7 @@ import torch.nn as nn
 from utils.utils import *
 from utils.evaluation import evaluate_dataset
 from model.AnomalyTransformer import AnomalyTransformer
-from data_factory.data_loader import get_loader_segment
+from data_factory.data_loader_2D import get_loader_segment
 
 
 def my_kl_loss(p, q, eps=1e-8):

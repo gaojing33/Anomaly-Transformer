@@ -16,6 +16,7 @@ except ImportError:
 from utils.utils import *
 from utils.evaluation import evaluate_dataset
 from model.AnomalyTransformer import AnomalyTransformer
+#from data_factory.data_loader_2D import get_loader_segment
 from data_factory.data_loader import get_loader_segment
 
 

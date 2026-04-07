@@ -1,3 +1,4 @@
+& "c:\Users\User\Desktop\5106 group project\Anomaly-Transformer\.venv\Scripts\Activate.ps1"
 #SWaT train
 python main.py --mode train --dataset SWaT --data_path ./dataset/SWaT --input_c 51 --output_c 51 --win_size 100 --num_epochs 3 --batch_size 256 --lr 1e-4 --anormly_ratio 1 --k 3 --e_layers 3 --d_model 512 --n_heads 8 --d_ff 512 --dropout 0.0 --activation gelu --output_attention true --prior_type mixture --n_mixtures 3 --normalize_prior true --sigma_activation softplus --sigma_min 1e-4 --discrepancy jsd --lambda_max 3 --lambda_warmup_epochs 2 --sigma_smooth_weight 0.01 --sigma_cross_layer_weight 0.0 --model_save_path checkpoints
 
