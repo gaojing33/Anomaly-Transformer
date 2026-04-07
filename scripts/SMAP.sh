@@ -66,3 +66,7 @@ python main.py \
   --sigma_smooth_weight 0.01 \
   --sigma_cross_layer_weight 0.0 \
   --model_save_path checkpoints
+
+
+#python main.py --mode train --dataset SMAP --data_path dataset/SMAP --input_c 25 --output_c 25 --win_size 100 --num_epochs 3 --batch_size 32 --lr 1e-4 --anormly_ratio 1 --k 2 --e_layers 3 --d_model 512 --n_heads 8 --d_ff 512 --dropout 0.0 --activation gelu --output_attention true --prior_type gaussian --n_mixtures 2 --normalize_prior true --sigma_activation softplus --sigma_min 1e-2 --discrepancy kl --lambda_max 2 --lambda_warmup_epochs 1 --sigma_smooth_weight 0.0 --sigma_cross_layer_weight 0.0 --model_save_path checkpoints *> logs\SMAP_train.log
+#python main.py --mode test --dataset SMAP --data_path dataset/SMAP --input_c 25 --output_c 25 --win_size 100 --batch_size 32 --anormly_ratio 1 --k 2 --e_layers 3 --d_model 512 --n_heads 8 --d_ff 512 --dropout 0.0 --activation gelu --output_attention true --prior_type gaussian --n_mixtures 1 --normalize_prior true --sigma_activation softplus --sigma_min 1e-2 --discrepancy kl --lambda_max 2 --lambda_warmup_epochs 1 --sigma_smooth_weight 0.0 --sigma_cross_layer_weight 0.0 --model_save_path checkpoints *> logs\SMAP_test.log

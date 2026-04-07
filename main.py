@@ -1,5 +1,6 @@
 import os
 import argparse
+import torch
 
 from torch.backends import cudnn
 from utils.utils import *
@@ -13,7 +14,8 @@ def str2bool(v):
 
 
 def main(config):
-    cudnn.benchmark = True
+    if torch.cuda.is_available():
+        cudnn.benchmark = True
 
     if not os.path.exists(config.model_save_path):
         mkdir(config.model_save_path)
@@ -56,9 +58,11 @@ if __name__ == '__main__':
 
     # ========= dataset / paths =========
     parser.add_argument('--pretrained_model', type=str, default=None)
-    parser.add_argument('--dataset', type=str, default='credit')
-    parser.add_argument('--data_path', type=str, default='./dataset/creditcard_ts.csv')
+    parser.add_argument('--dataset', type=str, default='CreditCard')
+    parser.add_argument('--data_path', type=str, default='./dataset/CreditCard')
     parser.add_argument('--model_save_path', type=str, default='checkpoints')
+
+    
 
     # ========= model architecture =========
     parser.add_argument('--e_layers', type=int, default=3)

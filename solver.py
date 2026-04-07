@@ -1,3 +1,4 @@
+# GPU-version (stable)
 import os
 import time
 import numpy as np
@@ -5,10 +6,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+try:
+    import torch_directml
+    HAS_DML = True
+except ImportError:
+    torch_directml = None
+    HAS_DML = False
+
 from utils.utils import *
 from utils.evaluation import evaluate_dataset
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.data_loader import get_loader_segment
+
+
+def is_finite_number(x):
+    return np.isfinite(float(x))
+
+
+def safe_item(x):
+    if torch.is_tensor(x):
+        return x.detach().float().cpu().item()
+    return float(x)
 
 
 def my_kl_loss(p, q, eps=1e-8):
@@ -20,8 +38,13 @@ def my_kl_loss(p, q, eps=1e-8):
     Return:
         [B, L]
     """
-    res = p * (torch.log(p + eps) - torch.log(q + eps))
+    p = torch.clamp(p, min=eps)
+    q = torch.clamp(q, min=eps)
+    p = p / torch.clamp(torch.sum(p, dim=-1, keepdim=True), min=eps)
+    q = q / torch.clamp(torch.sum(q, dim=-1, keepdim=True), min=eps)
+    res = p * (torch.log(p) - torch.log(q))
     return torch.mean(torch.sum(res, dim=-1), dim=1)
+
 
 
 def my_jsd_loss(p, q, eps=1e-8):
@@ -33,11 +56,18 @@ def my_jsd_loss(p, q, eps=1e-8):
     Return:
         [B, L]
     """
+    p = torch.clamp(p, min=eps)
+    q = torch.clamp(q, min=eps)
+    p = p / torch.clamp(torch.sum(p, dim=-1, keepdim=True), min=eps)
+    q = q / torch.clamp(torch.sum(q, dim=-1, keepdim=True), min=eps)
     m = 0.5 * (p + q)
-    kl_pm = p * (torch.log(p + eps) - torch.log(m + eps))
-    kl_qm = q * (torch.log(q + eps) - torch.log(m + eps))
+    m = torch.clamp(m, min=eps)
+    m = m / torch.clamp(torch.sum(m, dim=-1, keepdim=True), min=eps)
+    kl_pm = p * (torch.log(p) - torch.log(m))
+    kl_qm = q * (torch.log(q) - torch.log(m))
     jsd = 0.5 * torch.sum(kl_pm, dim=-1) + 0.5 * torch.sum(kl_qm, dim=-1)
     return torch.mean(jsd, dim=1)
+
 
 
 def adjust_learning_rate(optimizer, epoch, lr_):
@@ -57,12 +87,20 @@ class EarlyStopping:
         self.best_score = None
         self.best_score2 = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.val_loss2_min = np.Inf
+        self.val_loss_min = np.inf
+        self.val_loss2_min = np.inf
         self.delta = delta
         self.dataset = dataset_name
 
     def __call__(self, val_loss, val_loss2, model, path):
+        if (not is_finite_number(val_loss)) or (not is_finite_number(val_loss2)):
+            print(f'Invalid validation loss detected: val_loss={val_loss}, val_loss2={val_loss2}. Skip saving.')
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return
+
         score = -val_loss
         score2 = -val_loss2
         if self.best_score is None:
@@ -101,12 +139,13 @@ class Solver(object):
         "n_mixtures": 1,
         "normalize_prior": True,
         "sigma_activation": "softplus",
-        "sigma_min": 1e-4,
-        "discrepancy": "jsd",
+        "sigma_min": 1e-2,
+        "discrepancy": "kl",
         "lambda_max": None,
-        "lambda_warmup_epochs": 0,
+        "lambda_warmup_epochs": 1,
         "sigma_smooth_weight": 0.0,
         "sigma_cross_layer_weight": 0.0,
+        "grad_clip": 1.0,
     }
 
     def __init__(self, config):
@@ -141,7 +180,18 @@ class Solver(object):
             dataset=self.dataset
         )
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda:0")
+            self.device_name = "cuda:0"
+        elif HAS_DML:
+            self.device = torch_directml.device()
+            self.device_name = "directml"
+        else:
+            self.device = torch.device("cpu")
+            self.device_name = "cpu"
+
+        print(f"Using device: {self.device_name} -> {self.device}")
+
         self.build_model()
         self.criterion = nn.MSELoss()
 
@@ -207,6 +257,9 @@ class Solver(object):
             cur_prior = self._get_discrepancy_loss(prior_u, series_u.detach()) + \
                         self._get_discrepancy_loss(series_u.detach(), prior_u)
 
+            cur_series = torch.nan_to_num(cur_series, nan=0.0, posinf=1e6, neginf=-1e6)
+            cur_prior = torch.nan_to_num(cur_prior, nan=0.0, posinf=1e6, neginf=-1e6)
+
             series_loss += torch.mean(cur_series)
             prior_loss += torch.mean(cur_prior)
 
@@ -233,6 +286,7 @@ class Solver(object):
         if self.sigma_smooth_weight > 0:
             smooth_reg = 0.0
             for sigma in sigma_list:
+                sigma = torch.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=-1e6)
                 if sigma.size(2) > 1:
                     smooth_reg = smooth_reg + torch.mean((sigma[:, :, 1:, :] - sigma[:, :, :-1, :]) ** 2)
             reg = reg + self.sigma_smooth_weight * (smooth_reg / len(sigma_list))
@@ -240,12 +294,15 @@ class Solver(object):
         if self.sigma_cross_layer_weight > 0 and len(sigma_list) > 1:
             cross_reg = 0.0
             for idx in range(1, len(sigma_list)):
-                cross_reg = cross_reg + torch.mean((sigma_list[idx] - sigma_list[idx - 1]) ** 2)
+                s1 = torch.nan_to_num(sigma_list[idx], nan=0.0, posinf=1e6, neginf=-1e6)
+                s0 = torch.nan_to_num(sigma_list[idx - 1], nan=0.0, posinf=1e6, neginf=-1e6)
+                cross_reg = cross_reg + torch.mean((s1 - s0) ** 2)
             reg = reg + self.sigma_cross_layer_weight * (cross_reg / (len(sigma_list) - 1))
 
         if not isinstance(reg, torch.Tensor):
             reg = torch.tensor(reg, device=self.device)
 
+        reg = torch.nan_to_num(reg, nan=0.0, posinf=1e6, neginf=-1e6)
         return reg
 
     def vali(self, vali_loader, epoch_idx=0):
@@ -259,14 +316,26 @@ class Solver(object):
         with torch.no_grad():
             for _, (input_data, _) in enumerate(vali_loader):
                 input = input_data.float().to(self.device)
+
+                if not torch.isfinite(input).all():
+                    print('Warning: non-finite input detected in validation loader, skipping batch.')
+                    continue
+
                 output, series, prior, sigmas, mixture_weights = self.model(input)
 
+                rec_loss = self.criterion(output, input)
                 series_loss, prior_loss, _, _ = self._association_losses(series, prior)
                 sigma_reg = self._sigma_regularization(sigmas)
-                rec_loss = self.criterion(output, input)
 
-                loss_1.append((rec_loss - lambda_cur * series_loss + sigma_reg).item())
-                loss_2.append((rec_loss + lambda_cur * prior_loss + sigma_reg).item())
+                total_1 = rec_loss - lambda_cur * series_loss + sigma_reg
+                total_2 = rec_loss + lambda_cur * prior_loss + sigma_reg
+
+                if torch.isfinite(total_1) and torch.isfinite(total_2):
+                    loss_1.append(safe_item(total_1))
+                    loss_2.append(safe_item(total_2))
+
+        if len(loss_1) == 0 or len(loss_2) == 0:
+            return np.nan, np.nan
 
         return np.average(loss_1), np.average(loss_2)
 
@@ -284,33 +353,44 @@ class Solver(object):
         for epoch in range(self.num_epochs):
             iter_count = 0
             loss1_list = []
+            skipped_batches = 0
 
             epoch_time = time.time()
             lambda_cur = self._get_current_lambda(epoch)
 
             self.model.train()
             for i, (input_data, labels) in enumerate(self.train_loader):
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 iter_count += 1
 
                 input = input_data.float().to(self.device)
+                if not torch.isfinite(input).all():
+                    skipped_batches += 1
+                    print(f'Warning: non-finite input detected in training batch {i}, skipping batch.')
+                    continue
+
                 output, series, prior, sigmas, mixture_weights = self.model(input)
 
-                series_loss, prior_loss, _, _ = self._association_losses(series, prior)
                 rec_loss = self.criterion(output, input)
+                series_loss, prior_loss, _, _ = self._association_losses(series, prior)
                 sigma_reg = self._sigma_regularization(sigmas)
 
                 loss1 = rec_loss - lambda_cur * series_loss + sigma_reg
                 loss2 = rec_loss + lambda_cur * prior_loss + sigma_reg
 
-                loss1_list.append(loss1.item())
+                if (not torch.isfinite(loss1)) or (not torch.isfinite(loss2)):
+                    skipped_batches += 1
+                    print(f'Warning: non-finite loss at epoch {epoch + 1}, batch {i + 1}; skipping optimizer step.')
+                    continue
+
+                loss1_list.append(loss1.detach().float().cpu().item())
 
                 if (i + 1) % 100 == 0:
-                    speed = (time.time() - time_now) / iter_count
+                    speed = (time.time() - time_now) / max(iter_count, 1)
                     left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
                     print(
-                        '\tspeed: {:.4f}s/iter; left time: {:.4f}s | lambda: {:.6f}'.format(
-                            speed, left_time, lambda_cur
+                        '\tspeed: {:.4f}s/iter; left time: {:.4f}s | lambda: {:.6f} | skipped: {}'.format(
+                            speed, left_time, lambda_cur, skipped_batches
                         )
                     )
                     iter_count = 0
@@ -318,16 +398,18 @@ class Solver(object):
 
                 loss1.backward(retain_graph=True)
                 loss2.backward()
+                if self.grad_clip is not None and self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(loss1_list)
+            train_loss = np.average(loss1_list) if len(loss1_list) > 0 else np.nan
 
             vali_loss1, vali_loss2 = self.vali(self.vali_loader, epoch_idx=epoch)
 
             print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} | Vali Loss1: {3:.7f} | Vali Loss2: {4:.7f} | lambda: {5:.6f}".format(
-                    epoch + 1, train_steps, train_loss, vali_loss1, vali_loss2, lambda_cur
+                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} | Vali Loss1: {3:.7f} | Vali Loss2: {4:.7f} | lambda: {5:.6f} | skipped: {6}".format(
+                    epoch + 1, train_steps, train_loss, vali_loss1, vali_loss2, lambda_cur, skipped_batches
                 )
             )
 
@@ -353,16 +435,21 @@ class Solver(object):
         with torch.no_grad():
             for _, (input_data, labels) in enumerate(loader):
                 input = input_data.float().to(self.device)
+                if not torch.isfinite(input).all():
+                    continue
+
                 output, series, prior, sigmas, mixture_weights = self.model(input)
 
-                loss = torch.mean(criterion(input, output), dim=-1)  # [B, L]
+                loss = torch.mean(criterion(input, output), dim=-1)
                 _, _, series_loss_map, prior_loss_map = self._association_losses(series, prior)
 
-                series_loss_map = series_loss_map * temperature
-                prior_loss_map = prior_loss_map * temperature
+                series_loss_map = torch.nan_to_num(series_loss_map * temperature, nan=0.0, posinf=1e6, neginf=-1e6)
+                prior_loss_map = torch.nan_to_num(prior_loss_map * temperature, nan=0.0, posinf=1e6, neginf=-1e6)
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
 
                 metric = torch.softmax((-series_loss_map - prior_loss_map), dim=-1)
                 cri = metric * loss
+                cri = torch.nan_to_num(cri, nan=0.0, posinf=1e6, neginf=-1e6)
 
                 cri = cri.detach().cpu().numpy()
                 attens_energy.append(cri)
@@ -370,7 +457,7 @@ class Solver(object):
                 if labels is not None:
                     labels_list.append(labels.detach().cpu().numpy() if torch.is_tensor(labels) else labels)
 
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1) if len(attens_energy) > 0 else np.array([])
 
         if len(labels_list) > 0:
             labels_np = np.concatenate(labels_list, axis=0).reshape(-1)
@@ -380,9 +467,13 @@ class Solver(object):
         return attens_energy, labels_np
 
     def test(self):
+        ckpt_path = os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint.pth')
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
+
         self.model.load_state_dict(
             torch.load(
-                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint.pth'),
+                ckpt_path,
                 map_location=self.device
             )
         )
@@ -393,17 +484,13 @@ class Solver(object):
         criterion = nn.MSELoss(reduction='none')
         temperature = 50
 
-        # 1) validation scores for threshold selection
         val_scores, _ = self._compute_energy(self.vali_loader, criterion, temperature=temperature)
-
-        # 2) test scores and labels for final evaluation
         test_scores, test_labels = self._compute_energy(self.test_loader, criterion, temperature=temperature)
 
         print("val_scores shape: ", np.asarray(val_scores).shape)
         print("test_scores shape:", np.asarray(test_scores).shape)
         print("test_labels shape:", np.asarray(test_labels).shape)
 
-        # Raw evaluation
         raw_results, raw_pred = evaluate_dataset(
             dataset_name=self.dataset,
             val_scores=val_scores,
@@ -412,7 +499,6 @@ class Solver(object):
             use_adjustment=False
         )
 
-        # Adjusted evaluation
         adj_results, adj_pred = evaluate_dataset(
             dataset_name=self.dataset,
             val_scores=val_scores,
