@@ -134,4 +134,5 @@ dataset/
 # Logs
 log/
 
+#use CPU solver
 solver_cpu.py
